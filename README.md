@@ -44,25 +44,23 @@ The **notebook** identity needs **Build** permission on the *Fabric Capacity Met
 3. Schedule it **hourly** (Capacity Metrics data lags ~15–30 min, so hourly is the right cadence).
 
 ### 3. The runbook (one thing to create)
-1. **Managed identity:** grant the Automation account's identity, on each Fabric capacity (or its resource group), a custom role with `Microsoft.Fabric/capacities/read` and `Microsoft.Fabric/capacities/write`.
-2. **Modules:** import `Az.Accounts` (pulls `Az.Resources`).
+1. **Managed identity:** grant the Automation account's identity, at the subscription or resource‑group scope containing your capacities: **Reader** (so it can auto‑discover each capacity's subscription + resource group by name) plus `Microsoft.Fabric/capacities/read` and `Microsoft.Fabric/capacities/write` (to resize).
+2. **Modules:** import `Az.Accounts`.
 3. **Create a PowerShell runbook**, paste `runbook/Invoke-CapacityAutoscale.ps1`, and **Publish**.
-4. **Edit the embedded config** (the `$EmbeddedConfigJson` block near the top) only if you need per‑capacity `minSku`/`maxSku`/`reservedFloorSku` limits — otherwise defaults are fine.
+4. **Edit the embedded config** (the `$EmbeddedConfigJson` block near the top) only if you need per‑capacity overrides (`minSku`/`maxSku`/`reservedFloorSku`), a notification `webhookUrl`, or a subscription/resourceGroup override for a narrowly‑scoped identity. Otherwise defaults are fine.
 
 ### 4. Run it from the Test pane
-Open **Test pane** and set parameters:
+Open **Test pane** — the only parameters are:
 
 | Parameter | For first (safe) run | To actually resize |
 |-----------|----------------------|--------------------|
 | `SqlEndpoint` | `<lakehouse>.datawarehouse.fabric.microsoft.com` | same |
 | `LakehouseName` | your Lakehouse name | same |
 | `DryRun` | **True** (log only) | **False** |
-| `SubscriptionId` | — | your subscription |
-| `ResourceGroup` | — | the capacity's RG |
-| `WebhookUrl` | *(optional)* Teams/Workflows webhook | same |
-| `CapacityFilter` | *(optional)* one capacity name | same |
+| `MinSku` | global floor, e.g. `F2` | same |
+| `MaxSku` | global ceiling, e.g. `F256` | same |
 
-Leave `DryRun = True` for the first runs and read the output. When the decisions look right, set `DryRun = False`, then **schedule** the runbook hourly (a few minutes after the notebook).
+Subscription and resource group are discovered automatically from each capacity's name — no need to supply them. Leave `DryRun = True` for the first runs and read the output; when the decisions look right, set `DryRun = False`, then **schedule** the runbook hourly (a few minutes after the notebook).
 
 ## Anti‑flap (no state to manage)
 - **Hysteresis:** N consecutive hourly snapshots must agree before acting (from the Lakehouse history).

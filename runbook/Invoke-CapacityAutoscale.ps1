@@ -9,39 +9,37 @@
     capacity, and resizes the base SKU via ARM.
 
     Setup:
-      1. Assign the Automation account's Managed Identity, on each Fabric capacity:
-           Microsoft.Fabric/capacities/read, Microsoft.Fabric/capacities/write
-      2. Import Az.Accounts (pulls Az.Resources) into the Automation account.
+      1. Assign the Automation account's Managed Identity these roles at the
+         subscription or resource-group scope that contains your capacities:
+           Reader (to auto-discover each capacity's subscription + resource group),
+           Microsoft.Fabric/capacities/read + write (to resize).
+      2. Import Az.Accounts into the Automation account.
       3. Create this runbook, paste this file, Publish.
-      4. Test pane -> set SqlEndpoint + LakehouseName (and SubscriptionId +
-         ResourceGroup when you're ready to really resize) -> Run.
+      4. Test pane -> set SqlEndpoint + LakehouseName -> Run (DryRun stays True).
+
+    Subscription + resource group are resolved automatically from the capacity
+    name, so they are not parameters. (Override in the embedded config only if the
+    identity can't list capacities: set azure.subscriptionId + the capacity's
+    resourceGroup.) Webhook URL and lookback hours are in the embedded config.
 
     SAFETY: DryRun defaults to $true (log only). Set it to $false to actually
     resize. Anti-flap is built in and needs no stored state:
       * Hysteresis: N consecutive snapshots from the Lakehouse history must agree.
       * Cooldown: derived from the last observed SKU change in that same history.
 
-.PARAMETER SqlEndpoint     Lakehouse SQL analytics endpoint (e.g. xxx.datawarehouse.fabric.microsoft.com).
-.PARAMETER LakehouseName   Database name on that endpoint (holds capacity_metrics_history).
-.PARAMETER DryRun          $true (default) logs only; $false performs resizes.
-.PARAMETER SubscriptionId  Azure subscription of the capacities (required to resize).
-.PARAMETER ResourceGroup   Default resource group for the capacities (required to resize).
-.PARAMETER WebhookUrl      Optional Teams/Workflows webhook for notifications.
-.PARAMETER CapacityFilter  Optional: only act on this capacity name (blank = all).
-.PARAMETER LookbackHours   Hours of history to read for hysteresis/cooldown (default 8).
-.PARAMETER ConfigPath      Optional: load config JSON from a file to override the embedded config.
+.PARAMETER SqlEndpoint    Lakehouse SQL analytics endpoint (e.g. xxx.datawarehouse.fabric.microsoft.com).
+.PARAMETER LakehouseName  Database name on that endpoint (holds capacity_metrics_history).
+.PARAMETER DryRun         $true (default) logs only; $false performs resizes.
+.PARAMETER MinSku         Global floor SKU - never scale below this (default F2). Per-capacity overrides live in the embedded config.
+.PARAMETER MaxSku         Global ceiling SKU - never scale above this (default F2048). Per-capacity overrides live in the embedded config.
 #>
 [CmdletBinding()]
 param(
-    [string]$SqlEndpoint    = '',
-    [string]$LakehouseName  = '',
-    [bool]$DryRun           = $true,
-    [string]$SubscriptionId = '',
-    [string]$ResourceGroup  = '',
-    [string]$WebhookUrl     = '',
-    [string]$CapacityFilter = '',
-    [int]$LookbackHours     = 8,
-    [string]$ConfigPath     = ''
+    [string]$SqlEndpoint   = '',
+    [string]$LakehouseName = '',
+    [bool]$DryRun          = $true,
+    [string]$MinSku        = 'F2',
+    [string]$MaxSku        = 'F2048'
 )
 
 Set-StrictMode -Version Latest
@@ -50,9 +48,10 @@ $VerbosePreference  = 'SilentlyContinue'   # hide "Importing cmdlet/alias" modul
 $ProgressPreference = 'SilentlyContinue'
 
 # ===========================================================================
-# EMBEDDED CONFIG - thresholds, SKU ladder, per-capacity min/max/floor.
-# Environment values (subscription, resource group, webhook) come from the
-# PARAMETERS above. Edit the per-capacity limits / reserved floors here.
+# EMBEDDED CONFIG - thresholds, SKU ladder, optional per-capacity overrides.
+# MinSku/MaxSku come from the PARAMETERS above (a capacity can override them here).
+# Subscription + resource group are auto-discovered by capacity name; set them
+# here only if the identity can't list capacities. Webhook + lookback here too.
 # ===========================================================================
 $EmbeddedConfigJson = @'
 {
@@ -63,17 +62,17 @@ $EmbeddedConfigJson = @'
     "targetHeadroomPct": 80,
     "cooldownMinutes": 60,
     "consecutiveSignalsRequired": 3,
-    "scaleDownConsecutiveSignalsRequired": 6
+    "scaleDownConsecutiveSignalsRequired": 6,
+    "lookbackHours": 8
   },
-  "notifications": { "notifyOnDryRun": true, "notifyOnNoAction": false },
+  "notifications": { "webhookUrl": "", "notifyOnDryRun": true, "notifyOnNoAction": false },
   "skuLadder": ["F2","F4","F8","F16","F32","F64","F128","F256","F512","F1024","F2048"],
   "boundaries": { "slowResizePairs": [["F32","F64"]], "slowAtOrAbove": "F512" },
-  "azure": { "apiVersion": "2023-11-01" },
-  "defaults": { "enabled": true, "reservedFloorSku": null, "minSku": "F2", "maxSku": "F2048" },
+  "azure": { "apiVersion": "2023-11-01", "subscriptionId": "" },
+  "defaults": { "enabled": true, "reservedFloorSku": null },
   "capacities": {
-    "tmcadlfabric": {
-      "capacityId": "49B9055E-B898-4EB4-B829-0688D8BB6685",
-      "region": "East US",
+    "_example": {
+      "_note": "Optional per-capacity overrides. Add a block keyed by the capacity name.",
       "enabled": true,
       "minSku": "F8",
       "maxSku": "F256",
@@ -216,11 +215,7 @@ function Get-Prop {
     if ($null -eq $p -or $null -eq $p.Value) { return $Default }
     return $p.Value
 }
-function Get-Config {
-    param([string]$Path)
-    if ($Path) { return (Get-Content -Raw -Path $Path | ConvertFrom-Json) }
-    return ($EmbeddedConfigJson | ConvertFrom-Json)
-}
+function Get-Config { return ($EmbeddedConfigJson | ConvertFrom-Json) }
 function Get-SqlAccessToken {
     $t = Get-AzAccessToken -ResourceUrl 'https://database.windows.net/'
     if ($t.Token -is [System.Security.SecureString]) { return (New-Object System.Net.NetworkCredential('', $t.Token)).Password }
@@ -255,16 +250,14 @@ ORDER BY capacity_id, snapshot_time_utc DESC;
     } finally { $conn.Close() }
 }
 function Merge-CapConfig {
-    param($Config, [string]$CapName, [string]$DefaultResourceGroup)
+    param($Config, [string]$CapName, [string]$DefaultMinSku, [string]$DefaultMaxSku)
     $d = $Config.defaults; $c = Get-Prop $Config.capacities $CapName
-    $rg = [string](Get-Prop $c 'resourceGroup' '')
-    if ([string]::IsNullOrWhiteSpace($rg)) { $rg = $DefaultResourceGroup }
     return [pscustomobject]@{
         enabled          = [bool](Get-Prop $c 'enabled' (Get-Prop $d 'enabled' $true))
-        minSku           = [string](Get-Prop $c 'minSku' (Get-Prop $d 'minSku' 'F2'))
-        maxSku           = [string](Get-Prop $c 'maxSku' (Get-Prop $d 'maxSku' 'F2048'))
+        minSku           = [string](Get-Prop $c 'minSku' $DefaultMinSku)
+        maxSku           = [string](Get-Prop $c 'maxSku' $DefaultMaxSku)
         reservedFloorSku = Get-Prop $c 'reservedFloorSku' (Get-Prop $d 'reservedFloorSku' $null)
-        resourceGroup    = $rg
+        resourceGroup    = [string](Get-Prop $c 'resourceGroup' '')
     }
 }
 function Get-MinutesSinceLastResize {
@@ -278,12 +271,25 @@ function Get-MinutesSinceLastResize {
     }
     return [double]::PositiveInfinity
 }
+function Get-FabricCapacityIndex {
+    # Map lowercased capacity name -> full ARM resource id, across accessible subscriptions.
+    param([string]$ApiVersion)
+    $map = @{}
+    foreach ($sub in (Get-AzSubscription -ErrorAction SilentlyContinue)) {
+        try {
+            $resp = Invoke-AzRestMethod -Method GET -Path "/subscriptions/$($sub.Id)/providers/Microsoft.Fabric/capacities?api-version=$ApiVersion"
+            if ($resp.StatusCode -eq 200) {
+                foreach ($c in (($resp.Content | ConvertFrom-Json).value)) { $map[$c.name.ToLower()] = $c.id }
+            }
+        } catch { }
+    }
+    return $map
+}
 function Invoke-CapacityResize {
-    param([string]$SubscriptionId, [string]$ResourceGroup, [string]$CapacityName, [string]$TargetSku, [string]$ApiVersion)
-    $path = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.Fabric/capacities/$CapacityName`?api-version=$ApiVersion"
+    param([string]$ResourceId, [string]$TargetSku, [string]$ApiVersion)
     $payload = @{ sku = @{ name = $TargetSku; tier = 'Fabric' } } | ConvertTo-Json -Depth 4
-    $resp = Invoke-AzRestMethod -Method PATCH -Path $path -Payload $payload
-    if ($resp.StatusCode -ge 300) { throw "Resize $CapacityName -> $TargetSku failed: HTTP $($resp.StatusCode) $($resp.Content)" }
+    $resp = Invoke-AzRestMethod -Method PATCH -Path "$ResourceId`?api-version=$ApiVersion" -Payload $payload
+    if ($resp.StatusCode -ge 300) { throw "Resize -> $TargetSku failed: HTTP $($resp.StatusCode) $($resp.Content)" }
     return $resp.StatusCode
 }
 function Send-CapacityNotification {
@@ -324,25 +330,26 @@ function Start-Autoscale {
         Connect-AzAccount -Identity -WarningAction SilentlyContinue | Out-Null
     }
 
-    $config    = Get-Config -Path $ConfigPath
-    $subId     = if ($SubscriptionId) { $SubscriptionId } else { [string](Get-Prop $config.azure 'subscriptionId' '') }
+    $config    = Get-Config
+    $subId     = [string](Get-Prop $config.azure 'subscriptionId' '')
     $apiVer    = [string](Get-Prop $config.azure 'apiVersion' '2023-11-01')
     $cool      = [int](Get-Prop $config.evaluation 'cooldownMinutes' 60)
+    $lookback  = [int](Get-Prop $config.evaluation 'lookbackHours' 8)
     $notif     = Get-Prop $config 'notifications'
-    $webhook   = if ($WebhookUrl) { $WebhookUrl } else { [string](Get-Prop $notif 'webhookUrl' '') }
+    $webhook   = [string](Get-Prop $notif 'webhookUrl' '')
     $notifyDry = [bool](Get-Prop $notif 'notifyOnDryRun' $true)
     $notifyNon = [bool](Get-Prop $notif 'notifyOnNoAction' $false)
     $nowUtc    = [DateTime]::UtcNow
+    $capIndex  = $null   # lazily built ARM name->id map (only when a real resize is needed)
 
-    $allRows = Get-MetricSnapshots -Endpoint $SqlEndpoint -Database $LakehouseName -Lookback $LookbackHours
-    if ($allRows.Count -eq 0) { Write-Warning "No snapshots in the last $LookbackHours h - is the notebook running?"; return }
+    $allRows = Get-MetricSnapshots -Endpoint $SqlEndpoint -Database $LakehouseName -Lookback $lookback
+    if ($allRows.Count -eq 0) { Write-Warning "No snapshots in the last $lookback h - is the notebook running?"; return }
 
     $report = New-Object System.Collections.Generic.List[object]
     foreach ($grp in ($allRows | Group-Object capacity_name)) {
-        $capName = $grp.Name
-        if ($CapacityFilter -and $capName -ne $CapacityFilter) { continue }
+        $capName  = $grp.Name
         $snaps    = @($grp.Group)
-        $capCfg   = Merge-CapConfig -Config $config -CapName $capName -DefaultResourceGroup $ResourceGroup
+        $capCfg   = Merge-CapConfig -Config $config -CapName $capName -DefaultMinSku $MinSku -DefaultMaxSku $MaxSku
         $decision = Get-CapacityDecision -Snapshots $snaps -Config $config -CapConfig $capCfg
 
         $m = $snaps[0]
@@ -367,14 +374,19 @@ function Start-Autoscale {
             Write-Output "    -> DRY RUN: would resize to $($decision.TargetSku)"
             $entry.Outcome = 'would-scale'; $report.Add($entry); continue
         }
-        if ([string]::IsNullOrWhiteSpace($subId)) {
-            Write-Warning "    -> no SubscriptionId; cannot resize."; $entry.Outcome = 'error'; $entry.Reasons = 'missing SubscriptionId'; $report.Add($entry); continue
+        # Resolve the ARM resource id: config override (sub + RG) else auto-discover by name.
+        if ($subId -and $capCfg.resourceGroup) {
+            $resourceId = "/subscriptions/$subId/resourceGroups/$($capCfg.resourceGroup)/providers/Microsoft.Fabric/capacities/$capName"
+        } else {
+            if ($null -eq $capIndex) { $capIndex = Get-FabricCapacityIndex -ApiVersion $apiVer }
+            $resourceId = $capIndex[$capName.ToLower()]
         }
-        if ([string]::IsNullOrWhiteSpace($capCfg.resourceGroup)) {
-            Write-Warning "    -> no ResourceGroup for $capName; skipping."; $entry.Outcome = 'blocked-no-rg'; $report.Add($entry); continue
+        if ([string]::IsNullOrWhiteSpace($resourceId)) {
+            Write-Warning "    -> couldn't resolve ARM id for $capName. Give the identity Reader on the subscription, or set azure.subscriptionId + the capacity's resourceGroup in the embedded config."
+            $entry.Outcome = 'error'; $entry.Reasons = 'ARM resource id not found'; $report.Add($entry); continue
         }
         try {
-            $code = Invoke-CapacityResize -SubscriptionId $subId -ResourceGroup $capCfg.resourceGroup -CapacityName $capName -TargetSku $decision.TargetSku -ApiVersion $apiVer
+            $code = Invoke-CapacityResize -ResourceId $resourceId -TargetSku $decision.TargetSku -ApiVersion $apiVer
             Write-Output "    -> RESIZED to $($decision.TargetSku) (HTTP $code)"; $entry.Outcome = 'resized'
         } catch { Write-Warning "    -> RESIZE FAILED: $_"; $entry.Outcome = 'error'; $entry.Reasons = "$_" }
         $report.Add($entry)
