@@ -304,7 +304,7 @@ function Send-CapacityNotification {
     if ($items.Count -eq 0) { return }
     $mode = if ($IsDryRun) { 'DRY RUN' } else { 'EXECUTE' }
     $facts = foreach ($r in $items) {
-        $val = if ($r.Action -eq 'none') { "no action - $($r.Reasons)" }
+        $val = if ($r.Action -eq 'none') { "HOLD - $($r.Reasons)" }
                else { "$($r.Action.ToUpper()) $($r.CurrentSku) -> $($r.TargetSku)  [$($r.Outcome)]  -  $($r.Reasons)" }
         @{ name = "$($r.Capacity)"; value = "$val" }
     }
@@ -396,7 +396,7 @@ function Start-Autoscale {
     $cols = @(
         @{ H = 'Capacity';         W = 26; Get = { param($e) if ($e.Capacity.Length -gt 26) { $e.Capacity.Substring(0, 25) + '~' } else { $e.Capacity } } }
         @{ H = 'SKU';              W = 5;  Get = { param($e) "$($e.CurrentSku)" } }
-        @{ H = 'Decision';         W = 26; Get = { param($e) if ($e.Action -eq 'none') { $e.Outcome } else { "$($e.Action.ToUpper()) -> $($e.TargetSku) [$($e.Outcome)]" } } }
+        @{ H = 'Decision';         W = 26; Get = { param($e) if ($e.Action -eq 'none') { 'HOLD' } else { "$($e.Action.ToUpper()) -> $($e.TargetSku) [$($e.Outcome)]" } } }
         @{ H = 'Util% 1h/24h/7d';  W = 16; Get = { param($e) $e.Util } }
         @{ H = 'Thr(s) 1h/24h';    W = 13; Get = { param($e) $e.Thr } }
         @{ H = 'Rej 1h/24h';       W = 10; Get = { param($e) $e.Rej } }
@@ -411,8 +411,19 @@ function Start-Autoscale {
     foreach ($e in $report) {
         Write-Output (($cols | ForEach-Object { & $pad (& $_.Get $e) $_.W }) -join ' | ')
     }
-    Write-Output "`nReasons:"
+    Write-Output "`nReasons (the metric(s) behind each decision):"
     foreach ($r in $report) { Write-Output ("  - [$($r.Capacity)] $($r.Reasons)") }
+
+    $ev = $config.evaluation
+    Write-Output "`nHow to read this (policy from config):"
+    Write-Output ("  UP    when there is throttling now (Thr(s) > 0, Rej > 0, or any P95 >= 100%), OR Util% 1h stays above $($ev.scaleUpUtilizationPct)% for $($ev.consecutiveSignalsRequired) snapshots in a row.")
+    Write-Output ("        -> jumps to the smallest SKU that brings projected Util% under $($ev.targetHeadroomPct)%.")
+    Write-Output ("  DOWN  when Util% 24h AND 7d both stay below $($ev.scaleDownPeakUtilizationPct)% for $($ev.scaleDownConsecutiveSignalsRequired) snapshots with zero throttling; steps down one SKU, never below the floor.")
+    Write-Output  "  HOLD  none of the above: inside the healthy band, not enough consistent history yet, or a non-F/trial SKU."
+    Write-Output  "  Columns: Util% = avg utilization vs base compute (1h/24h/7d)."
+    Write-Output  "           Thr(s) = seconds throttled; Rej = operations rejected (1h/24h) - any nonzero means users/jobs are being hit now."
+    Write-Output  "           P95 d/r/b = throttling-RISK %: interactive Delay / interactive Rejection / Background rejection (100% = throttling starts)."
+    Write-Output  "           Risk = Metrics-app health; Sn = hourly snapshots of history available (UP needs $($ev.consecutiveSignalsRequired), DOWN needs $($ev.scaleDownConsecutiveSignalsRequired))."
     Write-Output ''
 
     Send-CapacityNotification -Report $report.ToArray() -WebhookUrl $webhook -NotifyOnDryRun $notifyDry -NotifyOnNoAction $notifyNon -IsDryRun $DryRun -Now $nowUtc
