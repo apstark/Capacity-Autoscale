@@ -60,11 +60,10 @@ The notebook identity needs **Build** permission on the *Fabric Capacity Metrics
    `Microsoft.Fabric/capacities/read`, `Microsoft.Fabric/capacities/write`
    (add `suspend/action`, `resume/action` if you later add pause/resume).
 2. **Modules:** import `Az.Accounts` (and it pulls `Az.Resources` for `Invoke-AzRestMethod`).
-3. **Variables:**
-   - `AutoscaleConfig` — paste the contents of `config/autoscale-config.json` (fill in `subscriptionId`, each capacity's `resourceGroup`, and `reservedFloorSku` if reserved).
-   - `AutoscaleState` — initial value `{}` (holds cooldown/audit state).
-4. Import both `runbook/*.ps1` (keep them in the same runbook or publish `Decision-Logic.ps1` as a child/module — in Automation, inline the functions if you can't dot‑source `$PSScriptRoot`).
-5. **Schedule** `Invoke-CapacityAutoscale` hourly, a few minutes after the notebook.
+3. **Config is embedded in the runbook** — edit the `$EmbeddedConfigJson` block in `runbook/Invoke-CapacityAutoscale.ps1` (fill in `subscriptionId`, each capacity's `resourceGroup`, and `reservedFloorSku` if reserved). No `AutoscaleConfig` variable is required. *(Optional override: keep config external by creating an Automation variable and passing `-ConfigVariableName`, or a file via `-ConfigPath`.)*
+4. **Variables:** `AutoscaleState` — initial value `{}` (holds cooldown/audit state).
+5. Import both `runbook/*.ps1` (keep them in the same runbook or publish `Decision-Logic.ps1` as a child/module — in Automation, inline the functions if you can't dot‑source `$PSScriptRoot`).
+6. **Schedule** `Invoke-CapacityAutoscale` hourly, a few minutes after the notebook.
 
 ### 4. Go live safely
 Runbook parameters:

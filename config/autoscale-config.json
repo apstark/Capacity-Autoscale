@@ -1,6 +1,6 @@
 {
   "$schema": "./autoscale-config.schema.json",
-  "_comment": "Central policy for the Fabric capacity autoscaler. Thresholds are documentation-grounded: scale up on sustained >80% peak or any throttling; scale down only when sustained peak <30% AND the smaller SKU keeps peak under targetHeadroomPct. See docs/scaling-policy.md.",
+  "_comment": "Central policy for the Fabric capacity autoscaler. Thresholds are documentation-grounded: scale up on sustained >80% peak or any throttling; scale down only when sustained peak <30% AND the smaller SKU keeps peak under targetHeadroomPct. See docs/scaling-policy.md. NOTE: the runbook (runbook/Invoke-CapacityAutoscale.ps1) embeds a mirror of this config as its self-contained default - keep the two in sync, or pass this file via -ConfigPath to override.",
 
   "evaluation": {
     "scaleUpUtilizationPct": 80,

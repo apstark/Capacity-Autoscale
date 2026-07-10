@@ -19,13 +19,19 @@
     Actually perform resizes. Omit for a no-op dry run (recommended first).
 
 .PARAMETER ConfigPath
-    Local path to autoscale-config.json (for local testing). In Automation, omit
-    and store the JSON in an Automation variable named by -ConfigVariableName.
+    Optional override. Local path to autoscale-config.json (handy for local
+    testing). If omitted, the config EMBEDDED in this runbook is used, so the
+    runbook is self-contained - no Automation variable required.
+
+.PARAMETER ConfigVariableName
+    Optional override. Name of an Automation variable holding config JSON. Leave
+    empty (default) to use the embedded config. Precedence: -ConfigPath > this
+    variable > embedded.
 #>
 [CmdletBinding()]
 param(
     [string]$ConfigPath,
-    [string]$ConfigVariableName = 'AutoscaleConfig',
+    [string]$ConfigVariableName = '',
     [string]$StateVariableName  = 'AutoscaleState',
     [Parameter(Mandatory)][string]$SqlEndpoint,     # Lakehouse SQL analytics endpoint (server)
     [Parameter(Mandatory)][string]$LakehouseName,   # database name on that endpoint
@@ -48,10 +54,51 @@ function Get-Prop {
     return $p.Value
 }
 
+# ---------------------------------------------------------------------------
+# EMBEDDED CONFIG  (self-contained default; source of truth for the runbook)
+# Mirror of config/autoscale-config.json - keep the two in sync. Edit the values
+# below for your environment (subscriptionId, each capacity's resourceGroup, and
+# reservedFloorSku if the capacity is on an Azure reservation).
+# ---------------------------------------------------------------------------
+$EmbeddedConfigJson = @'
+{
+  "evaluation": {
+    "scaleUpUtilizationPct": 80,
+    "scaleUpThrottleWarnPct": 80,
+    "scaleDownPeakUtilizationPct": 30,
+    "targetHeadroomPct": 80,
+    "cooldownMinutes": 60,
+    "consecutiveSignalsRequired": 3,
+    "scaleDownConsecutiveSignalsRequired": 6
+  },
+  "skuLadder": ["F2","F4","F8","F16","F32","F64","F128","F256","F512","F1024","F2048"],
+  "boundaries": { "slowResizePairs": [["F32","F64"]], "slowAtOrAbove": "F512" },
+  "azure": { "subscriptionId": "<SET_ME>", "apiVersion": "2023-11-01" },
+  "defaults": { "enabled": true, "reservedFloorSku": null, "minSku": "F2", "maxSku": "F2048" },
+  "capacities": {
+    "tmcadlfabric": {
+      "capacityId": "49B9055E-B898-4EB4-B829-0688D8BB6685",
+      "resourceGroup": "<SET_ME>",
+      "region": "East US",
+      "enabled": true,
+      "minSku": "F8",
+      "maxSku": "F256",
+      "reservedFloorSku": null
+    }
+  }
+}
+'@
+
 function Get-Config {
+    # Precedence: -ConfigPath (file) > -ConfigVariableName (Automation var) > embedded default.
     if ($ConfigPath) { return (Get-Content -Raw -Path $ConfigPath | ConvertFrom-Json) }
-    $raw = Get-AutomationVariable -Name $ConfigVariableName   # Automation runtime cmdlet
-    return ($raw | ConvertFrom-Json)
+    if (-not [string]::IsNullOrWhiteSpace($ConfigVariableName)) {
+        try {
+            $raw = Get-AutomationVariable -Name $ConfigVariableName
+            if (-not [string]::IsNullOrWhiteSpace($raw)) { return ($raw | ConvertFrom-Json) }
+        } catch { Write-Warning "Config variable '$ConfigVariableName' not usable; using embedded config. $_" }
+    }
+    return ($EmbeddedConfigJson | ConvertFrom-Json)
 }
 
 function Get-State {
