@@ -1,0 +1,23 @@
+# Secrets / local settings
+*.local.json
+config/*.local.json
+.env
+*.pem
+*.pfx
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# PowerShell
+*.psd1.bak
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vs/
+.vscode/
+*.log

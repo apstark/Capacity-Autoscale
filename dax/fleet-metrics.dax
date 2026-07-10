@@ -1,0 +1,39 @@
+// ============================================================================
+// Fleet metrics extract  (Tier 1 - decision backbone)
+// ----------------------------------------------------------------------------
+// One row per capacity, all capacities at once, NO TREATAS required.
+// Uses the Capacity Metrics app's Health-page "... by capacity (last N)" measures,
+// which resolve correctly when grouped by Capacities[Uppercase capacity Id].
+//
+// Only columns that actually populate in this bare context are included.
+// (Overage CUhr / Max CU limit / autoscale / interactive-vs-background split are
+//  timepoint-scoped and require the TREATAS capacity+timepoint injection - that is
+//  the deferred Tier-2 deep dive, not needed for the scale up/down decision.)
+//
+// Run target: Fabric Capacity Metrics semantic model.
+// Consumed by: notebook/collect_capacity_metrics.py (sempy evaluate_dax).
+// ============================================================================
+EVALUATE
+SUMMARIZECOLUMNS(
+    'Capacities'[Uppercase capacity Id],
+    'Capacities'[Capacity name],
+    'Capacities'[Region without default],
+    'Capacities'[SKU],
+    'Capacities'[State],
+    "Util % 1h",          [Average utilization by capacity (last 1 hour)],
+    "Util % 24h",         [Average utilization by capacity (last 24 hours)],
+    "Util % 7d",          [Average utilization by capacity (last 7 days)],
+    "Variance 1h",        [Usage variance by capacity (last 1 hour)],
+    "Throttling s 1h",    [Throttling(s) by capacity (last 1 hour)],
+    "Throttling s 24h",   [Throttling(s) by capacity (last 24 hours)],
+    "P95 int delay 1h",   [P95 interactive delay by capacity (last 1 hour)],
+    "P95 int reject 1h",  [P95 interactive rejection by capacity (last 1 hour)],
+    "P95 bg reject 1h",   [P95 background rejection by capacity (last 1 hour)],
+    "Rejected ops 1h",    [Rejected operations by capacity (last 1 hour)],
+    "Rejected ops 24h",   [Rejected operations by capacity (last 24 hours)],
+    "Users 1h",           [Users by capacity (last 1 hour)],
+    "Users 24h",          [Users by capacity (last 24 hours)],
+    "Successful ops 24h", [Successful operations by capacity (last 24 hours)],
+    "Risk 1h",            [Risk status by capacity (last 1 hour)],
+    "Risk 24h",           [Risk status by capacity (last 24 hours)]
+)

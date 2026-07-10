@@ -1,0 +1,50 @@
+{
+  "$schema": "./autoscale-config.schema.json",
+  "_comment": "Central policy for the Fabric capacity autoscaler. Thresholds are documentation-grounded: scale up on sustained >80% peak or any throttling; scale down only when sustained peak <30% AND the smaller SKU keeps peak under targetHeadroomPct. See docs/scaling-policy.md.",
+
+  "evaluation": {
+    "scaleUpUtilizationPct": 80,
+    "scaleUpThrottleWarnPct": 80,
+    "scaleDownPeakUtilizationPct": 30,
+    "targetHeadroomPct": 80,
+    "cooldownMinutes": 60,
+    "consecutiveSignalsRequired": 3,
+    "scaleDownConsecutiveSignalsRequired": 6,
+    "_comment": "consecutiveSignalsRequired = how many recent hourly snapshots must all agree before acting (hysteresis). Scale-down demands more confirmations than scale-up. cooldownMinutes = min time since the last resize before another is allowed."
+  },
+
+  "skuLadder": ["F2", "F4", "F8", "F16", "F32", "F64", "F128", "F256", "F512", "F1024", "F2048"],
+
+  "boundaries": {
+    "_comment": "Resizes that cross these boundaries are slower / have licensing side effects (per Microsoft docs). The runbook still performs them but logs a warning and treats them conservatively.",
+    "slowResizePairs": [["F32", "F64"]],
+    "slowAtOrAbove": "F512"
+  },
+
+  "azure": {
+    "subscriptionId": "<SET_ME>",
+    "apiVersion": "2023-11-01",
+    "_comment": "resourceGroup is per-capacity below because capacities can live in different RGs/regions."
+  },
+
+  "defaults": {
+    "enabled": true,
+    "reservedFloorSku": null,
+    "minSku": "F2",
+    "maxSku": "F2048",
+    "_comment": "reservedFloorSku: scaling below a reserved instance does not reduce the bill (docs), so never auto-scale below it. null = no reservation (PAYG), free to shrink to minSku."
+  },
+
+  "capacities": {
+    "tmcadlfabric": {
+      "capacityId": "49B9055E-B898-4EB4-B829-0688D8BB6685",
+      "resourceGroup": "<SET_ME>",
+      "region": "East US",
+      "enabled": true,
+      "minSku": "F8",
+      "maxSku": "F256",
+      "reservedFloorSku": null,
+      "_comment": "Set reservedFloorSku to your reserved size (e.g. F64) if this capacity is on an Azure reservation; leave null if pay-as-you-go."
+    }
+  }
+}
