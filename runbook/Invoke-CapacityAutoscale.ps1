@@ -85,6 +85,8 @@ $EmbeddedConfigJson = @'
 # ===========================================================================
 # DECISION LOGIC (pure functions - unit-tested by tests/Decision-Logic.Tests.ps1)
 # ===========================================================================
+function Fmt1 { param($v) if ($null -eq $v) { 'n/a' } else { [math]::Round([double]$v, 1) } }
+
 function Get-SkuCU {
     param([Parameter(Mandatory)][string]$Sku)
     if ($Sku -match '^[Ff](\d+)$') { return [int]$Matches[1] }
@@ -141,10 +143,17 @@ function Get-CapacityDecision {
     if (-not $CapConfig.enabled) { $decision.Reasons += 'capacity disabled in config'; return $decision }
     if ("$($newest.state)".ToLower() -ne 'active') { $decision.Reasons += "state=$($newest.state) (not Active)"; return $decision }
     if ([string]::IsNullOrWhiteSpace($curSku)) { $decision.Reasons += 'SKU not reported'; return $decision }
+    if ($curSku -notmatch '^F\d+$') { $decision.Reasons += "SKU '$curSku' is not an F-SKU - not auto-scalable (e.g. trial capacity)"; return $decision }
 
-    # SCALE UP - immediate on real throttling, else sustained hot.
-    $hardThrottle = ($newest.throttling_s_1h -gt 0) -or ($newest.rejected_ops_1h -gt 0) -or
-                    ($newest.p95_int_delay_1h -ge 100) -or ($newest.p95_int_reject_1h -ge 100) -or ($newest.p95_bg_reject_1h -ge 100)
+    # SCALE UP - immediate on real throttling, else sustained hot. Name the metric that tripped.
+    $thr = @()
+    if ($newest.throttling_s_1h  -gt 0)  { $thr += "throttling $(Fmt1 $newest.throttling_s_1h)s (1h)" }
+    if ($newest.rejected_ops_1h  -gt 0)  { $thr += "$([int]$newest.rejected_ops_1h) rejected ops (1h)" }
+    if ($newest.p95_int_delay_1h  -ge 100) { $thr += "interactive-delay P95 $(Fmt1 $newest.p95_int_delay_1h)%" }
+    if ($newest.p95_int_reject_1h -ge 100) { $thr += "interactive-rejection P95 $(Fmt1 $newest.p95_int_reject_1h)%" }
+    if ($newest.p95_bg_reject_1h  -ge 100) { $thr += "background-rejection P95 $(Fmt1 $newest.p95_bg_reject_1h)%" }
+    $hardThrottle = $thr.Count -gt 0
+
     $sustainedHot = Test-NewestAll -Snapshots $Snapshots -Count $ev.consecutiveSignalsRequired -Predicate {
         param($s) ($s.util_pct_1h -gt $ev.scaleUpUtilizationPct) -or (Test-Unhealthy $s.risk_1h)
     }
@@ -153,9 +162,11 @@ function Get-CapacityDecision {
                     -Ladder $ladder -MaxSku $CapConfig.maxSku -HeadroomPct $ev.targetHeadroomPct
         if ($target -and (Get-SkuIndex $target $ladder) -gt (Get-SkuIndex $curSku $ladder)) {
             $decision.Action = 'up'; $decision.TargetSku = $target
-            if ($hardThrottle) { $decision.Reasons += 'active throttling on newest snapshot' }
-            if ($sustainedHot) { $decision.Reasons += "sustained util > $($ev.scaleUpUtilizationPct)% over $($ev.consecutiveSignalsRequired) snapshots" }
-        } else { $decision.Reasons += "up wanted but already at maxSku ($($CapConfig.maxSku))" }
+            if ($hardThrottle) { $decision.Reasons += "active throttling: $($thr -join ', ')" }
+            if ($sustainedHot) { $decision.Reasons += "sustained util 1h > $($ev.scaleUpUtilizationPct)% (now $(Fmt1 $newest.util_pct_1h)%) over $($ev.consecutiveSignalsRequired) snapshots" }
+            $proj = [double]$newest.util_pct_1h * (Get-SkuCU $curSku) / (Get-SkuCU $target)
+            $decision.Reasons += "-> $target brings projected util ~$(Fmt1 $proj)% (target headroom $($ev.targetHeadroomPct)%)"
+        } else { $decision.Reasons += "up wanted (util 1h $(Fmt1 $newest.util_pct_1h)%) but already at maxSku ($($CapConfig.maxSku))" }
         return $decision
     }
 
@@ -176,15 +187,20 @@ function Get-CapacityDecision {
             $projected = [double]$newest.util_pct_24h * (Get-SkuCU $curSku) / (Get-SkuCU $nextDown)
             if ($projected -lt $ev.targetHeadroomPct) {
                 $decision.Action = 'down'; $decision.TargetSku = $nextDown
-                $decision.Reasons += "sustained util < $($ev.scaleDownPeakUtilizationPct)% (24h & 7d) over $($ev.scaleDownConsecutiveSignalsRequired) snapshots; projected $([math]::Round($projected,1))% on $nextDown"
+                $decision.Reasons += "sustained low: util 24h $(Fmt1 $newest.util_pct_24h)% & 7d $(Fmt1 $newest.util_pct_7d)% both < $($ev.scaleDownPeakUtilizationPct)% over $($ev.scaleDownConsecutiveSignalsRequired) snapshots, no throttling; -> $nextDown projects ~$(Fmt1 $projected)% (< headroom $($ev.targetHeadroomPct)%)"
             } else {
-                $decision.Reasons += "down skipped: projected $([math]::Round($projected,1))% on $nextDown exceeds headroom $($ev.targetHeadroomPct)%"
+                $decision.Reasons += "down skipped: -> $nextDown would project $(Fmt1 $projected)% (>= headroom $($ev.targetHeadroomPct)%) from util 24h $(Fmt1 $newest.util_pct_24h)%"
             }
         }
         return $decision
     }
 
-    $decision.Reasons += 'within band - no action'
+    # No action: say which side of the band, with the numbers.
+    $bits = @("util 1h/24h/7d = $(Fmt1 $newest.util_pct_1h)/$(Fmt1 $newest.util_pct_24h)/$(Fmt1 $newest.util_pct_7d)%")
+    if ($newest.util_pct_24h -ge $ev.scaleDownPeakUtilizationPct) { $bits += "24h >= scale-down $($ev.scaleDownPeakUtilizationPct)%" }
+    else { $bits += "cold but not for $($ev.scaleDownConsecutiveSignalsRequired) consecutive snapshots (have $($Snapshots.Count))" }
+    if (($newest.throttling_s_24h -gt 0) -or ($newest.rejected_ops_24h -gt 0)) { $bits += "recent throttling blocks scale-down" }
+    $decision.Reasons += "within band ($($bits -join '; '))"
     return $decision
 }
 
@@ -327,6 +343,13 @@ function Start-Autoscale {
         $line = "[$capName] $($decision.CurrentSku) -> $($decision.Action.ToUpper())"
         if ($decision.Action -ne 'none') { $line += " ($($decision.TargetSku))" }
         Write-Output ($line + " :: " + ($decision.Reasons -join '; '))
+        $m = $snaps[0]
+        Write-Output ("    metrics: util 1h/24h/7d={0}/{1}/{2}% | throttle 1h/24h={3}/{4}s | rejected 1h/24h={5}/{6} | P95 delay/rej/bg={7}/{8}/{9}% | risk 1h/24h={10}/{11} | snapshots={12}" -f `
+            (Fmt1 $m.util_pct_1h), (Fmt1 $m.util_pct_24h), (Fmt1 $m.util_pct_7d), `
+            (Fmt1 $m.throttling_s_1h), (Fmt1 $m.throttling_s_24h), `
+            [int]$m.rejected_ops_1h, [int]$m.rejected_ops_24h, `
+            (Fmt1 $m.p95_int_delay_1h), (Fmt1 $m.p95_int_reject_1h), (Fmt1 $m.p95_bg_reject_1h), `
+            $m.risk_1h, $m.risk_24h, $snaps.Count)
 
         $entry = [pscustomobject]@{ Capacity = $capName; CurrentSku = $decision.CurrentSku; Action = $decision.Action
             TargetSku = $decision.TargetSku; Outcome = 'none'; Reasons = ($decision.Reasons -join '; ') }
