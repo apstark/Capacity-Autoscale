@@ -46,6 +46,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$VerbosePreference  = 'SilentlyContinue'   # hide "Importing cmdlet/alias" module-load spam
+$ProgressPreference = 'SilentlyContinue'
 
 # ===========================================================================
 # EMBEDDED CONFIG - thresholds, SKU ladder, per-capacity min/max/floor.
@@ -317,7 +319,10 @@ function Start-Autoscale {
         throw "SqlEndpoint and LakehouseName are required (set them in the Test pane)."
     }
     Write-Output "=== Fabric Capacity Autoscale run (DryRun=$DryRun) ==="
-    if (-not (Get-AzContext)) { Connect-AzAccount -Identity | Out-Null }
+    if (-not (Get-AzContext)) {
+        Import-Module Az.Accounts -Verbose:$false -ErrorAction SilentlyContinue *> $null
+        Connect-AzAccount -Identity -WarningAction SilentlyContinue | Out-Null
+    }
 
     $config    = Get-Config -Path $ConfigPath
     $subId     = if ($SubscriptionId) { $SubscriptionId } else { [string](Get-Prop $config.azure 'subscriptionId' '') }
@@ -340,19 +345,17 @@ function Start-Autoscale {
         $capCfg   = Merge-CapConfig -Config $config -CapName $capName -DefaultResourceGroup $ResourceGroup
         $decision = Get-CapacityDecision -Snapshots $snaps -Config $config -CapConfig $capCfg
 
-        $line = "[$capName] $($decision.CurrentSku) -> $($decision.Action.ToUpper())"
-        if ($decision.Action -ne 'none') { $line += " ($($decision.TargetSku))" }
-        Write-Output ($line + " :: " + ($decision.Reasons -join '; '))
         $m = $snaps[0]
-        Write-Output ("    metrics: util 1h/24h/7d={0}/{1}/{2}% | throttle 1h/24h={3}/{4}s | rejected 1h/24h={5}/{6} | P95 delay/rej/bg={7}/{8}/{9}% | risk 1h/24h={10}/{11} | snapshots={12}" -f `
-            (Fmt1 $m.util_pct_1h), (Fmt1 $m.util_pct_24h), (Fmt1 $m.util_pct_7d), `
-            (Fmt1 $m.throttling_s_1h), (Fmt1 $m.throttling_s_24h), `
-            [int]$m.rejected_ops_1h, [int]$m.rejected_ops_24h, `
-            (Fmt1 $m.p95_int_delay_1h), (Fmt1 $m.p95_int_reject_1h), (Fmt1 $m.p95_bg_reject_1h), `
-            $m.risk_1h, $m.risk_24h, $snaps.Count)
-
-        $entry = [pscustomobject]@{ Capacity = $capName; CurrentSku = $decision.CurrentSku; Action = $decision.Action
-            TargetSku = $decision.TargetSku; Outcome = 'none'; Reasons = ($decision.Reasons -join '; ') }
+        $entry = [pscustomobject]@{
+            Capacity = $capName; CurrentSku = $decision.CurrentSku; Action = $decision.Action
+            TargetSku = $decision.TargetSku; Outcome = 'none'; Reasons = ($decision.Reasons -join '; ')
+            Util  = "$(Fmt1 $m.util_pct_1h)/$(Fmt1 $m.util_pct_24h)/$(Fmt1 $m.util_pct_7d)"
+            Thr   = "$(Fmt1 $m.throttling_s_1h)/$(Fmt1 $m.throttling_s_24h)"
+            Rej   = "$([int]$m.rejected_ops_1h)/$([int]$m.rejected_ops_24h)"
+            P95   = "$(Fmt1 $m.p95_int_delay_1h)/$(Fmt1 $m.p95_int_reject_1h)/$(Fmt1 $m.p95_bg_reject_1h)"
+            Risk  = "$($m.risk_1h)"
+            Snaps = $snaps.Count
+        }
         if ($decision.Action -eq 'none') { $report.Add($entry); continue }
 
         $mins = Get-MinutesSinceLastResize -Snaps $snaps -Now $nowUtc
@@ -376,6 +379,26 @@ function Start-Autoscale {
         } catch { Write-Warning "    -> RESIZE FAILED: $_"; $entry.Outcome = 'error'; $entry.Reasons = "$_" }
         $report.Add($entry)
     }
+
+    # ---- Table summary + reasons ----
+    $rows = $report | ForEach-Object {
+        [pscustomobject]@{
+            Capacity          = if ($_.Capacity.Length -gt 26) { $_.Capacity.Substring(0, 25) + '~' } else { $_.Capacity }
+            SKU               = $_.CurrentSku
+            Decision          = if ($_.Action -eq 'none') { $_.Outcome } else { "$($_.Action.ToUpper())->$($_.TargetSku) [$($_.Outcome)]" }
+            'Util% 1h/24h/7d' = $_.Util
+            'Thr(s)'          = $_.Thr
+            Rej               = $_.Rej
+            'P95 d/r/b'       = $_.P95
+            Risk              = $_.Risk
+            Sn                = $_.Snaps
+        }
+    }
+    Write-Output ''
+    ($rows | Format-Table -AutoSize | Out-String -Width 500).TrimEnd() | Write-Output
+    Write-Output "`nReasons:"
+    foreach ($r in $report) { Write-Output ("  - [$($r.Capacity)] $($r.Reasons)") }
+    Write-Output ''
 
     Send-CapacityNotification -Report $report.ToArray() -WebhookUrl $webhook -NotifyOnDryRun $notifyDry -NotifyOnNoAction $notifyNon -IsDryRun $DryRun -Now $nowUtc
     Write-Output "=== Done ==="
