@@ -13,6 +13,13 @@
     "_comment": "consecutiveSignalsRequired = how many recent hourly snapshots must all agree before acting (hysteresis). Scale-down demands more confirmations than scale-up. cooldownMinutes = min time since the last resize before another is allowed."
   },
 
+  "notifications": {
+    "webhookUrl": "",
+    "notifyOnDryRun": true,
+    "notifyOnNoAction": false,
+    "_comment": "webhookUrl = a Teams Incoming Webhook / Power Automate Workflows URL. Empty = notifications off. notifyOnDryRun also covers cooldown-skipped actions."
+  },
+
   "skuLadder": ["F2", "F4", "F8", "F16", "F32", "F64", "F128", "F256", "F512", "F1024", "F2048"],
 
   "boundaries": {

@@ -1,6 +1,6 @@
 # Scaling policy (documentation-grounded)
 
-This is the "why" behind the thresholds in [`config/autoscale-config.json`](../config/autoscale-config.json) and the logic in [`runbook/Decision-Logic.ps1`](../runbook/Decision-Logic.ps1). All thresholds trace to Microsoft docs (linked inline).
+This is the "why" behind the thresholds and the decision logic in [`runbook/Invoke-CapacityAutoscale.ps1`](../runbook/Invoke-CapacityAutoscale.ps1) (also mirrored in [`config/autoscale-config.json`](../config/autoscale-config.json), which the unit tests read). All thresholds trace to Microsoft docs (linked inline).
 
 ## 1. The signal that actually matters
 
@@ -39,7 +39,7 @@ Then step **one SKU down** (never below `reservedFloorSku`/`minSku`).
 ## 4. Anti-flap
 
 - **Hysteresis:** N consecutive snapshots must agree (up = `consecutiveSignalsRequired`, down = `scaleDownConsecutiveSignalsRequired`, higher).
-- **Cooldown:** no second resize within `cooldownMinutes` (enforced from persisted state).
+- **Cooldown:** no second resize within `cooldownMinutes` — derived from the last observed SKU change in the metric history (no stored state).
 - React on the 1‑hour window; confirm scale‑down on 24 h **and** 7 d. Vertical scaling is fast with a short pause ([performance efficiency](https://learn.microsoft.com/azure/well-architected/microsoft-fabric/performance-efficiency)).
 
 ## 5. Let the built-in elastic features absorb spikes (recommended)
