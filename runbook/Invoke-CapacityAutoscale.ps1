@@ -380,22 +380,25 @@ function Start-Autoscale {
         $report.Add($entry)
     }
 
-    # ---- Table summary + reasons ----
-    $rows = $report | ForEach-Object {
-        [pscustomobject]@{
-            Capacity          = if ($_.Capacity.Length -gt 26) { $_.Capacity.Substring(0, 25) + '~' } else { $_.Capacity }
-            SKU               = $_.CurrentSku
-            Decision          = if ($_.Action -eq 'none') { $_.Outcome } else { "$($_.Action.ToUpper())->$($_.TargetSku) [$($_.Outcome)]" }
-            'Util% 1h/24h/7d' = $_.Util
-            'Thr(s)'          = $_.Thr
-            Rej               = $_.Rej
-            'P95 d/r/b'       = $_.P95
-            Risk              = $_.Risk
-            Sn                = $_.Snaps
-        }
-    }
+    # ---- Table summary + reasons (hand-rendered, pipe-separated for readability) ----
+    $cols = @(
+        @{ H = 'Capacity';         W = 26; Get = { param($e) if ($e.Capacity.Length -gt 26) { $e.Capacity.Substring(0, 25) + '~' } else { $e.Capacity } } }
+        @{ H = 'SKU';              W = 5;  Get = { param($e) "$($e.CurrentSku)" } }
+        @{ H = 'Decision';         W = 26; Get = { param($e) if ($e.Action -eq 'none') { $e.Outcome } else { "$($e.Action.ToUpper()) -> $($e.TargetSku) [$($e.Outcome)]" } } }
+        @{ H = 'Util% 1h/24h/7d';  W = 16; Get = { param($e) $e.Util } }
+        @{ H = 'Thr(s) 1h/24h';    W = 13; Get = { param($e) $e.Thr } }
+        @{ H = 'Rej 1h/24h';       W = 10; Get = { param($e) $e.Rej } }
+        @{ H = 'P95 d/r/b';        W = 16; Get = { param($e) $e.P95 } }
+        @{ H = 'Risk';             W = 8;  Get = { param($e) $e.Risk } }
+        @{ H = 'Sn';               W = 3;  Get = { param($e) "$($e.Snaps)" } }
+    )
+    $pad = { param($s, $w) $s = "$s"; if ($s.Length -gt $w) { $s.Substring(0, $w) } else { $s.PadRight($w) } }
     Write-Output ''
-    ($rows | Format-Table -AutoSize | Out-String -Width 500).TrimEnd() | Write-Output
+    Write-Output (($cols | ForEach-Object { & $pad $_.H $_.W }) -join ' | ')
+    Write-Output (($cols | ForEach-Object { '-' * $_.W }) -join '-+-')
+    foreach ($e in $report) {
+        Write-Output (($cols | ForEach-Object { & $pad (& $_.Get $e) $_.W }) -join ' | ')
+    }
     Write-Output "`nReasons:"
     foreach ($r in $report) { Write-Output ("  - [$($r.Capacity)] $($r.Reasons)") }
     Write-Output ''
