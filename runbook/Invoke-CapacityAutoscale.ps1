@@ -342,8 +342,13 @@ function Start-Autoscale {
     $nowUtc    = [DateTime]::UtcNow
     $capIndex  = $null   # lazily built ARM name->id map (only when a real resize is needed)
 
-    $allRows = Get-MetricSnapshots -Endpoint $SqlEndpoint -Database $LakehouseName -Lookback $lookback
-    if ($allRows.Count -eq 0) { Write-Warning "No snapshots in the last $lookback h - is the notebook running?"; return }
+    # @() so an empty result is an empty array (not $null) - $null.Count throws under StrictMode.
+    $allRows = @(Get-MetricSnapshots -Endpoint $SqlEndpoint -Database $LakehouseName -Lookback $lookback)
+    if ($allRows.Count -eq 0) {
+        Write-Warning "No snapshots in the last $lookback h. The collection notebook hasn't written recently - schedule it hourly (or widen lookbackHours). Nothing to evaluate."
+        Write-Output "=== Done (no data) ==="
+        return
+    }
 
     $report = New-Object System.Collections.Generic.List[object]
     foreach ($grp in ($allRows | Group-Object capacity_name)) {
