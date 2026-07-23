@@ -62,6 +62,58 @@ Open **Test pane** — the only parameters are:
 
 Subscription and resource group are discovered automatically from each capacity's name — no need to supply them. Leave `DryRun = True` for the first runs and read the output; when the decisions look right, set `DryRun = False`, then **schedule** the runbook **every 3 hours at 1:00** — i.e. ~30 min after the collection notebook, so it reads that cycle's fresh snapshot.
 
+## Scaling thresholds — and how many runs it takes to act
+
+Everything is timed off two schedules: the **notebook** writes one snapshot per capacity **every 3 hours** (8×/day), and the **runbook** evaluates the newest snapshots **every 3 hours**, 30 min behind. The core rule is that a decision needs **N consecutive snapshots to agree — i.e. N consecutive notebook runs** — before the runbook will act. One odd reading never moves anything.
+
+### Scale UP — two paths
+
+**Throttling now → 1 run (immediate).** If the newest snapshot shows real pain — `Thr(s) 1h > 0`, `Rej 1h > 0`, or **any** `P95 (delay / reject / bg) ≥ 100%` — the runbook scales up on the **very next run** and skips the consecutive-snapshot requirement entirely. Users are already being hit, so it doesn't wait. (100% P95 = the point throttling begins.)
+
+**Sustained load → 2 runs (preemptive).** With no throttling yet, if `Util% 1h > 80%` (or `Risk ≠ Healthy`) holds across **2 consecutive snapshots**, it scales up. Two notebook runs are ~3h apart, so this fires within about one cycle of the second hot reading.
+
+**How far up:** it jumps to the *smallest* SKU whose **projected** utilization lands under **80%** headroom — `current% × currentCU ÷ candidateCU` — and may skip several rungs at once to get there, never above `maxSku`. Example: 92% on F64 → F128 projects 46%, so it picks F128 in one move.
+
+### Scale DOWN — one path, deliberately slower
+
+**Sustained idle → 4 runs.** Every one of the **last 4 consecutive snapshots** must be cold:
+
+- `Util% 24h < 30%` **and** `Util% 7d < 30%` (both windows, not just the recent hour), **and**
+- `Thr(s) 24h = 0` **and** `Rej 24h = 0` **and** `Risk 24h = Healthy` (no recent pain).
+
+Four snapshots at 3h spacing is **~9–12 hours** of continuous quiet before it even recommends a step down. It then steps **exactly one SKU down**, and only if that smaller SKU still projects **under 80%** (`Util% 24h × currentCU ÷ nextCU`), never below `reservedFloorSku` / `minSku`.
+
+### At a glance
+
+| Action | Trigger (read from the snapshots) | Consecutive notebook runs | ≈ Time to act | Resulting move |
+|--------|-----------------------------------|:--:|:--:|----------------|
+| **UP — throttling** | `Thr(s) 1h > 0`, or `Rej 1h > 0`, or any `P95 ≥ 100%` | **1** | next run (≤ ~3h) | jump to smallest SKU projecting < 80% |
+| **UP — sustained** | `Util% 1h > 80%` (or `Risk ≠ Healthy`) | **2** | ~3–6h | jump to smallest SKU projecting < 80% |
+| **DOWN — idle** | `Util% 24h` **and** `7d` both < 30%, no throttling, Healthy | **4** | ~9–12h | one SKU down (only if it still projects < 80%) |
+| **HOLD** | anything else, or not enough history yet | — | — | no change |
+
+These counts are `consecutiveSignalsRequired = 2` and `scaleDownConsecutiveSignalsRequired = 4` in the config — raise them for more caution, lower for faster reactions. All the threshold numbers are documentation-grounded; the "why" behind each is in [docs/scaling-policy.md](docs/scaling-policy.md).
+
+### Worked example — a capacity going quiet
+
+```text
+run  time     Util% 24h/7d   cold snaps in a row   runbook decision
+ 1   00:30       28 / 27              1             HOLD  (need 4, have 1)
+ 2   03:30       26 / 27              2             HOLD  (need 4, have 2)
+ 3   06:30       27 / 26              3             HOLD  (need 4, have 3)
+ 4   09:30       25 / 26              4             DOWN -> one SKU  ✅  (~10h after it went quiet)
+ 5   12:30      (just resized)        —             HOLD [cooldown]  (only ~3h since the resize)
+ 6   15:30       22 / 24              —             free to act again (~6h since the resize)
+```
+
+A scale-**up** version of this runs far shorter: 2 rows for sustained load, or a single row the moment throttling shows.
+
+### After it acts: cooldown & first-deploy warm-up
+
+**Cooldown → ~1 skipped run.** After any resize, the runbook leaves that capacity alone until **`cooldownMinutes = 360` (6h)** have passed since the SKU change it sees in the history — so it sits out the next run (~3h later) and can move again on the one after (~6h). This gates **every** action, including immediate throttle-driven scale-ups, so a just-resized capacity that's still hot waits one cycle before stepping again — which is why scale-up jumps multiple rungs at once, so a single move usually suffices.
+
+**Warm-up.** The runbook can only count snapshots inside its `lookbackHours = 24` window. Right after you first enable collection, expect `HOLD` rows with a *"not enough consecutive snapshots (have N)"* reason until history accrues — 2 snapshots before any up decision, 4 before any down. That's expected, not a fault.
+
 ## Reading the runbook output
 
 Each run prints one row per capacity, a plain‑language reason for every decision, and a legend. Here's an annotated example (dry run):
@@ -104,10 +156,6 @@ Every number comes straight from the *Fabric Capacity Metrics* semantic model �
 
 ### Putting it together
 Read a row left‑to‑right: **Util%** tells you the load, **Thr(s)/Rej/P95** tell you whether that load is actually hurting anyone yet, **Risk** is the model's summary judgment, and **Sn** tells you whether there's enough history to trust the decision. The **Reasons** block underneath always names the specific metric(s) that produced the decision — so if a capacity is holding when you expected a move, the reason line tells you exactly which gate it's sitting behind (too few snapshots, recent throttling, projected‑fit, reserved floor, etc.). The runbook also prints a full **"How to read this"** legend after the table on every run, so the output is self‑documenting.
-
-## Anti‑flap (no state to manage)
-- **Hysteresis:** N consecutive snapshots (each ~3h apart) must agree before acting (from the Lakehouse history) — currently 2 to scale up (~6h), 4 to scale down (~12h). Real throttling bypasses hysteresis and scales up immediately.
-- **Cooldown:** derived from the last observed SKU change in that same history — no Automation variable needed. Set to 360 min so a resize skips the next scheduled run before another can occur.
 
 ## Local testing (dry run)
 
