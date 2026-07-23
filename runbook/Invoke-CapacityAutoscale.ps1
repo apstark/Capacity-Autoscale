@@ -5,8 +5,8 @@
     variables, no config files required.
 
 .DESCRIPTION
-    Reads hourly metrics from a Lakehouse SQL analytics endpoint, decides per
-    capacity, and resizes the base SKU via ARM.
+    Reads periodic metrics (collected every ~3h) from a Lakehouse SQL analytics
+    endpoint, decides per capacity, and resizes the base SKU via ARM.
 
     Setup:
       1. Assign the Automation account's Managed Identity these roles at the
@@ -60,10 +60,10 @@ $EmbeddedConfigJson = @'
     "scaleUpThrottleWarnPct": 80,
     "scaleDownPeakUtilizationPct": 30,
     "targetHeadroomPct": 80,
-    "cooldownMinutes": 60,
-    "consecutiveSignalsRequired": 3,
-    "scaleDownConsecutiveSignalsRequired": 6,
-    "lookbackHours": 8
+    "cooldownMinutes": 360,
+    "consecutiveSignalsRequired": 2,
+    "scaleDownConsecutiveSignalsRequired": 4,
+    "lookbackHours": 24
   },
   "notifications": { "webhookUrl": "", "notifyOnDryRun": true, "notifyOnNoAction": false },
   "skuLadder": ["F2","F4","F8","F16","F32","F64","F128","F256","F512","F1024","F2048"],
@@ -334,7 +334,7 @@ function Start-Autoscale {
     $subId     = [string](Get-Prop $config.azure 'subscriptionId' '')
     $apiVer    = [string](Get-Prop $config.azure 'apiVersion' '2023-11-01')
     $cool      = [int](Get-Prop $config.evaluation 'cooldownMinutes' 60)
-    $lookback  = [int](Get-Prop $config.evaluation 'lookbackHours' 8)
+    $lookback  = [int](Get-Prop $config.evaluation 'lookbackHours' 24)
     $notif     = Get-Prop $config 'notifications'
     $webhook   = [string](Get-Prop $notif 'webhookUrl' '')
     $notifyDry = [bool](Get-Prop $notif 'notifyOnDryRun' $true)
@@ -345,7 +345,7 @@ function Start-Autoscale {
     # @() so an empty result is an empty array (not $null) - $null.Count throws under StrictMode.
     $allRows = @(Get-MetricSnapshots -Endpoint $SqlEndpoint -Database $LakehouseName -Lookback $lookback)
     if ($allRows.Count -eq 0) {
-        Write-Warning "No snapshots in the last $lookback h. The collection notebook hasn't written recently - schedule it hourly (or widen lookbackHours). Nothing to evaluate."
+        Write-Warning "No snapshots in the last $lookback h. The collection notebook hasn't written recently - schedule it every 3 hours (or widen lookbackHours). Nothing to evaluate."
         Write-Output "=== Done (no data) ==="
         return
     }
@@ -428,7 +428,7 @@ function Start-Autoscale {
     Write-Output  "  Columns: Util% = avg utilization vs base compute (1h/24h/7d)."
     Write-Output  "           Thr(s) = seconds throttled; Rej = operations rejected (1h/24h) - any nonzero means users/jobs are being hit now."
     Write-Output  "           P95 d/r/b = throttling-RISK %: interactive Delay / interactive Rejection / Background rejection (100% = throttling starts)."
-    Write-Output  "           Risk = Metrics-app health; Sn = hourly snapshots of history available (UP needs $($ev.consecutiveSignalsRequired), DOWN needs $($ev.scaleDownConsecutiveSignalsRequired))."
+    Write-Output  "           Risk = Metrics-app health; Sn = snapshots of history available, ~3h apart (UP needs $($ev.consecutiveSignalsRequired), DOWN needs $($ev.scaleDownConsecutiveSignalsRequired))."
     Write-Output ''
 
     Send-CapacityNotification -Report $report.ToArray() -WebhookUrl $webhook -NotifyOnDryRun $notifyDry -NotifyOnNoAction $notifyNon -IsDryRun $DryRun -Now $nowUtc
