@@ -7,9 +7,9 @@ Policy is documentation‑grounded (see **[docs/scaling-policy.md](docs/scaling-
 ## Architecture
 
 ```text
-Fabric Notebook (hourly)              Azure Automation Runbook (hourly)
+Fabric Notebook (every 3h, :30)       Azure Automation Runbook (every 3h, +1h)
 collect_capacity_metrics.py           Invoke-CapacityAutoscale.ps1
-  runs fleet DAX via sempy              reads recent snapshots (SQL, AAD token)
+  runs fleet DAX via executeQueries     reads recent snapshots (SQL, AAD token)
   → appends Delta table                 decides per capacity (embedded logic)
         │                               → PATCH sku via ARM (Managed Identity)
         ▼                                        ▲
@@ -18,7 +18,7 @@ collect_capacity_metrics.py           Invoke-CapacityAutoscale.ps1
 ```
 
 Two moving parts:
-- **Collect** — [notebook/collect_capacity_metrics.py](notebook/collect_capacity_metrics.py) runs [dax/fleet-metrics.dax](dax/fleet-metrics.dax) and appends one row per capacity to a Lakehouse Delta table.
+- **Collect** — [notebook/collect_capacity_metrics.py](notebook/collect_capacity_metrics.py) runs the per‑capacity metric queries in [dax/fleet-metrics.dax](dax/fleet-metrics.dax) via the Power BI **executeQueries** REST API (the model blocks the XMLA/Discover calls `sempy.evaluate_dax` needs) and appends one row per capacity to a Lakehouse Delta table. Each query sets the model's `CapacitiesList` + region M parameters so its region‑scoped DirectQuery backend returns data instead of blanks.
 - **Decide + act** — [runbook/Invoke-CapacityAutoscale.ps1](runbook/Invoke-CapacityAutoscale.ps1) is a **single self‑contained runbook**: reads the history, decides, resizes via ARM. No sibling scripts, no Automation variables, no required config file.
 
 ## Repository layout
@@ -36,12 +36,12 @@ Two moving parts:
 ## Setup
 
 ### 1. Semantic model access
-The **notebook** identity needs **Build** permission on the *Fabric Capacity Metrics* semantic model (service → dataset → Manage permissions → Build).
+The **notebook** identity needs **Build** permission on the *Fabric Capacity Metrics* semantic model (service → dataset → Manage permissions → Build). Build also authorizes the executeQueries REST call the notebook uses; the tenant setting **Dataset Execute Queries REST API** must be enabled (Admin portal → Tenant settings).
 
 ### 2. Lakehouse + collection notebook
 1. Create/pick a Lakehouse; import `notebook/collect_capacity_metrics.py`; attach the Lakehouse.
-2. Run once — it creates `capacity_metrics_history`.
-3. Schedule it **hourly** (Capacity Metrics data lags ~15–30 min, so hourly is the right cadence).
+2. Run once — it creates `capacity_metrics_history`. Check the output: `region parameter:` should print a discovered name (not `None`), and `util_pct_1h` should be non‑zero.
+3. Schedule it **every 3 hours at :30** past the hour. On a Pro capacity the Metrics App model refreshes every 3 hours (8×/day from 12am); running at :30 picks up each refresh after it completes. (On a Fabric capacity you can refresh — and therefore collect and scale — more often.)
 
 ### 3. The runbook (one thing to create)
 1. **Managed identity:** grant the Automation account's identity, at the subscription or resource‑group scope containing your capacities: **Reader** (so it can auto‑discover each capacity's subscription + resource group by name) plus `Microsoft.Fabric/capacities/read` and `Microsoft.Fabric/capacities/write` (to resize).
@@ -60,11 +60,11 @@ Open **Test pane** — the only parameters are:
 | `MinSku` | global floor, e.g. `F2` | same |
 | `MaxSku` | global ceiling, e.g. `F256` | same |
 
-Subscription and resource group are discovered automatically from each capacity's name — no need to supply them. Leave `DryRun = True` for the first runs and read the output; when the decisions look right, set `DryRun = False`, then **schedule** the runbook hourly (a few minutes after the notebook).
+Subscription and resource group are discovered automatically from each capacity's name — no need to supply them. Leave `DryRun = True` for the first runs and read the output; when the decisions look right, set `DryRun = False`, then **schedule** the runbook **every 3 hours at 1:00** — i.e. ~30 min after the collection notebook, so it reads that cycle's fresh snapshot.
 
 ## Anti‑flap (no state to manage)
-- **Hysteresis:** N consecutive hourly snapshots must agree before acting (from the Lakehouse history).
-- **Cooldown:** derived from the last observed SKU change in that same history — no Automation variable needed.
+- **Hysteresis:** N consecutive snapshots (each ~3h apart) must agree before acting (from the Lakehouse history) — currently 2 to scale up (~6h), 4 to scale down (~12h). Real throttling bypasses hysteresis and scales up immediately.
+- **Cooldown:** derived from the last observed SKU change in that same history — no Automation variable needed. Set to 360 min so a resize skips the next scheduled run before another can occur.
 
 ## Local testing (dry run)
 
