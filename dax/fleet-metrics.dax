@@ -1,39 +1,61 @@
 // ============================================================================
 // Fleet metrics extract  (Tier 1 - decision backbone)
 // ----------------------------------------------------------------------------
-// One row per capacity, all capacities at once, NO TREATAS required.
-// Uses the Capacity Metrics app's Health-page "... by capacity (last N)" measures,
-// which resolve correctly when grouped by Capacities[Uppercase capacity Id].
+// Per-capacity metric pull, mirrored by notebook/collect_capacity_metrics.py.
 //
-// Only columns that actually populate in this bare context are included.
-// (Overage CUhr / Max CU limit / autoscale / interactive-vs-background split are
-//  timepoint-scoped and require the TREATAS capacity+timepoint injection - that is
-//  the deferred Tier-2 deep dive, not needed for the scale up/down decision.)
+// WHY PER CAPACITY (not one SUMMARIZECOLUMNS over the fleet):
+//   The Fabric Capacity Metrics fact tables are DirectQuery to a REGION-SCOPED
+//   backend, gated by two dynamic M parameters - 'CapacitiesList' and a region
+//   parameter (name discovered at runtime; commonly "CapacityRegion" or similar).
+//   A bare measure query with no parameters returns 0/blank for any capacity
+//   outside the model's default region. So the notebook loops every capacity and
+//   runs the query below with BOTH parameters set for that capacity.
 //
-// Run target: Fabric Capacity Metrics semantic model.
-// Consumed by: notebook/collect_capacity_metrics.py (sempy evaluate_dax).
+//   Transport: the Power BI executeQueries REST API (this model blocks the
+//   XMLA/Discover calls that sempy.evaluate_dax uses). executeQueries accepts the
+//   DEFINE MPARAMETER block below verbatim.
+//
+// Run target: Fabric Capacity Metrics semantic model (the populated install,
+//   i.e. the one that sits on a Fabric capacity).
+// ----------------------------------------------------------------------------
+// TEMPLATE - the notebook substitutes:
+//   <CAPACITY_ID>  the capacity's Id from EVALUATE 'Capacities'
+//   <REGION_PARAM> the discovered region-parameter name
+//   <REGION>       that capacity's region string (e.g. "East US")
+// Capacity dimension columns (id / name / region / SKU / state) come from a
+// separate  EVALUATE 'Capacities'  call; [Latest SKU] as a measure is unreliable,
+// so SKU + State are read from the dimension, not from a measure here.
 // ============================================================================
+DEFINE
+    MPARAMETER 'CapacitiesList' = { "<CAPACITY_ID>" }
+    MPARAMETER '<REGION_PARAM>' = "<REGION>"
 EVALUATE
-SUMMARIZECOLUMNS(
-    'Capacities'[Uppercase capacity Id],
-    'Capacities'[Capacity name],
-    'Capacities'[Region without default],
-    'Capacities'[SKU],
-    'Capacities'[State],
-    "Util % 1h",          [Average utilization by capacity (last 1 hour)],
-    "Util % 24h",         [Average utilization by capacity (last 24 hours)],
-    "Util % 7d",          [Average utilization by capacity (last 7 days)],
-    "Variance 1h",        [Usage variance by capacity (last 1 hour)],
-    "Throttling s 1h",    [Throttling(s) by capacity (last 1 hour)],
-    "Throttling s 24h",   [Throttling(s) by capacity (last 24 hours)],
-    "P95 int delay 1h",   [P95 interactive delay by capacity (last 1 hour)],
-    "P95 int reject 1h",  [P95 interactive rejection by capacity (last 1 hour)],
-    "P95 bg reject 1h",   [P95 background rejection by capacity (last 1 hour)],
-    "Rejected ops 1h",    [Rejected operations by capacity (last 1 hour)],
-    "Rejected ops 24h",   [Rejected operations by capacity (last 24 hours)],
-    "Users 1h",           [Users by capacity (last 1 hour)],
-    "Users 24h",          [Users by capacity (last 24 hours)],
-    "Successful ops 24h", [Successful operations by capacity (last 24 hours)],
-    "Risk 1h",            [Risk status by capacity (last 1 hour)],
-    "Risk 24h",           [Risk status by capacity (last 24 hours)]
+ROW(
+    "util_pct_1h",        [Average utilization by capacity (last 1 hour)],
+    "util_pct_24h",       [Average utilization by capacity (last 24 hours)],
+    "util_pct_7d",        [Average utilization by capacity (last 7 days)],
+    "variance_1h",        [Usage variance by capacity (last 1 hour)],
+    "throttling_s_1h",    [Throttling(s) by capacity (last 1 hour)],
+    "throttling_s_24h",   [Throttling(s) by capacity (last 24 hours)],
+    "p95_int_delay_1h",   [P95 interactive delay by capacity (last 1 hour)],
+    "p95_int_reject_1h",  [P95 interactive rejection by capacity (last 1 hour)],
+    "p95_bg_reject_1h",   [P95 background rejection by capacity (last 1 hour)],
+    "rejected_ops_1h",    [Rejected operations by capacity (last 1 hour)],
+    "rejected_ops_24h",   [Rejected operations by capacity (last 24 hours)],
+    "users_1h",           [Users by capacity (last 1 hour)],
+    "users_24h",          [Users by capacity (last 24 hours)],
+    "successful_ops_24h", [Successful operations by capacity (last 24 hours)],
+    "risk_1h",            [Risk status by capacity (last 1 hour)],
+    "risk_24h",           [Risk status by capacity (last 24 hours)]
 )
+
+// ----------------------------------------------------------------------------
+// Capacity dimension (run once, no parameters needed):
+//   EVALUATE 'Capacities'
+// yields Capacity Id / Capacity name / Region / SKU / State used to drive the
+// per-capacity loop above.
+//
+// Deferred Tier-2 (not needed for the scale up/down decision): overage CUhr,
+// Max CU limit, autoscale, and the interactive-vs-background CU split are
+// timepoint-scoped and require the TREATAS capacity+timepoint injection.
+// ============================================================================
