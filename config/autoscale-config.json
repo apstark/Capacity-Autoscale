@@ -7,10 +7,11 @@
     "scaleUpThrottleWarnPct": 80,
     "scaleDownPeakUtilizationPct": 30,
     "targetHeadroomPct": 80,
-    "cooldownMinutes": 60,
-    "consecutiveSignalsRequired": 3,
-    "scaleDownConsecutiveSignalsRequired": 6,
-    "_comment": "consecutiveSignalsRequired = how many recent hourly snapshots must all agree before acting (hysteresis). Scale-down demands more confirmations than scale-up. cooldownMinutes = min time since the last resize before another is allowed."
+    "cooldownMinutes": 360,
+    "consecutiveSignalsRequired": 2,
+    "scaleDownConsecutiveSignalsRequired": 4,
+    "lookbackHours": 24,
+    "_comment": "Tuned for a 3-hour collection cadence (the Metrics App model refreshes every 3h on a Pro capacity). consecutiveSignalsRequired = how many recent snapshots (each ~3h apart) must all agree before acting (hysteresis): 2 = ~6h to scale up, 4 = ~12h to scale down. Scale-down demands more confirmations than scale-up. cooldownMinutes = min time since the last resize before another is allowed (360 = skip the next scheduled run after a resize). lookbackHours = how much history the runbook reads; must be wide enough to hold scaleDownConsecutiveSignalsRequired snapshots (24h holds a full day of 3-hourly rows)."
   },
 
   "notifications": {
