@@ -62,6 +62,49 @@ Open **Test pane** — the only parameters are:
 
 Subscription and resource group are discovered automatically from each capacity's name — no need to supply them. Leave `DryRun = True` for the first runs and read the output; when the decisions look right, set `DryRun = False`, then **schedule** the runbook **every 3 hours at 1:00** — i.e. ~30 min after the collection notebook, so it reads that cycle's fresh snapshot.
 
+## Reading the runbook output
+
+Each run prints one row per capacity, a plain‑language reason for every decision, and a legend. Here's an annotated example (dry run):
+
+```text
+Capacity           | SKU   | Decision                  | Util% 1h/24h/7d  | Thr(s) 1h/24h | Rej 1h/24h | P95 d/r/b     | Risk    | Sn
+-------------------+-------+---------------------------+------------------+---------------+------------+---------------+---------+---
+prod-fabric-01     | F64   | UP -> F128 [would-scale]  | 92.4/71.2/68.9   | 0/0           | 0/0        | 45.1/0/0      | At risk | 4
+analytics-cap      | F32   | DOWN -> F16 [would-scale] | 12.1/9.8/11.2    | 0/0           | 0/0        | 0/0/0         | Healthy | 6
+reporting-cap      | F8    | HOLD                      | 48.0/44.5/50.3   | 0/0           | 0/0        | 0/0/0         | Healthy | 6
+
+Reasons (the metric(s) behind each decision):
+  - [prod-fabric-01] sustained util 1h > 80% (now 92.4%) over 2 snapshots; -> F128 brings projected util ~46.2% (target headroom 80%)
+  - [analytics-cap] sustained low: util 24h 9.8% & 7d 11.2% both < 30% over 4 snapshots, no throttling; -> F16 projects ~19.6% (< headroom 80%)
+  - [reporting-cap] within band (util 1h/24h/7d = 48/44.5/50.3%; 24h >= scale-down 30%)
+```
+
+### The Decision column
+`UP -> <sku>` / `DOWN -> <sku>` / `HOLD`, and for any non‑HOLD row a bracketed **outcome** tag telling you what actually happened to that intended action:
+
+| Tag | Meaning |
+|-----|---------|
+| `[would-scale]` | Dry run — this is the resize it *would* have performed. Nothing changed. |
+| `[resized]` | `DryRun=$false` and the ARM resize succeeded — the SKU was changed. |
+| `[cooldown]` | It wanted to act, but the last SKU change was too recent (within `cooldownMinutes`). Skipped. |
+| `[error]` | The resize failed, or the capacity's ARM resource id couldn't be resolved (identity needs Reader, or set the subscription/resourceGroup in config). |
+| *(HOLD, no tag)* | No action — inside the healthy band, not enough consistent history yet, or a non‑F/trial SKU. |
+
+### The metric columns
+Every number comes straight from the *Fabric Capacity Metrics* semantic model — the same values you'd see in the Metrics app, snapshotted hourly-ish (every ~3h here) into the Lakehouse.
+
+| Column | What it is | How to read it |
+|--------|-----------|----------------|
+| **Util% 1h/24h/7d** | Average utilization vs **base** capacity units (autoscale excluded), over the last 1 hour / 24 hours / 7 days. | The primary up/down signal. `1h` drives scale‑**up** (sustained > 80%); `24h` **and** `7d` together drive scale‑**down** (both < 30%). Fabric smooths usage, so this can read > 100% without throttling. |
+| **Thr(s) 1h/24h** | Seconds the capacity was actually **throttled** in the last hour / day. | Any nonzero = users or jobs are being delayed/rejected *now*. `1h > 0` forces an **immediate** scale‑up (bypasses hysteresis); `24h > 0` **blocks** scale‑down. |
+| **Rej 1h/24h** | Count of **operations rejected** (queries/jobs turned away) in the last hour / day. | Same role as throttling: `1h > 0` → immediate up; `24h > 0` → no down. |
+| **P95 d/r/b** | The three throttling‑**risk** percentages: interactive **D**elay / interactive **R**ejection / **B**ackground rejection. Each is the P95 of *future compute committed* as a % of the throttling limit. | These are the early‑warning gauges. **100% = throttling is starting.** Any of the three reading `>= 100` in the 1h window forces an immediate scale‑up, before `Thr(s)` even registers. Rising‑but‑under‑100 means headroom is tightening. |
+| **Risk** | The Metrics app's own health label for the capacity (`Healthy` / `At risk` / …). | Anything other than `Healthy`, sustained, counts as a scale‑up signal even if raw utilization hasn't crossed 80%. |
+| **Sn** | How many snapshots of history were in the lookback window for this capacity. | Confidence gate. Scale‑**up** needs `consecutiveSignalsRequired` snapshots (2), scale‑**down** needs `scaleDownConsecutiveSignalsRequired` (4). If **Sn is below the required count, the runbook can't act yet** even if the numbers look extreme — it's still accumulating confirmations. Right after you first deploy, expect several HOLDs purely because `Sn` is low. |
+
+### Putting it together
+Read a row left‑to‑right: **Util%** tells you the load, **Thr(s)/Rej/P95** tell you whether that load is actually hurting anyone yet, **Risk** is the model's summary judgment, and **Sn** tells you whether there's enough history to trust the decision. The **Reasons** block underneath always names the specific metric(s) that produced the decision — so if a capacity is holding when you expected a move, the reason line tells you exactly which gate it's sitting behind (too few snapshots, recent throttling, projected‑fit, reserved floor, etc.). The runbook also prints a full **"How to read this"** legend after the table on every run, so the output is self‑documenting.
+
 ## Anti‑flap (no state to manage)
 - **Hysteresis:** N consecutive snapshots (each ~3h apart) must agree before acting (from the Lakehouse history) — currently 2 to scale up (~6h), 4 to scale down (~12h). Real throttling bypasses hysteresis and scales up immediately.
 - **Cooldown:** derived from the last observed SKU change in that same history — no Automation variable needed. Set to 360 min so a resize skips the next scheduled run before another can occur.
@@ -89,6 +132,6 @@ The tests dot‑source the runbook (a guard skips the main body when dot‑sourc
 Set `WebhookUrl` (Teams Incoming Webhook or Power Automate Workflows URL) to get a summary card each run: what scaled, what *would* have scaled in dry‑run, cooldown skips, and errors. Empty = off. Tune `notifyOnDryRun` / `notifyOnNoAction` in the embedded config.
 
 ## Current state / notes
-- Tenant today: one capacity — **`tmcadlfabric`, F64, East US, ~20% utilized** → a scale‑down candidate once history accrues (set `reservedFloorSku` if it's on a reservation).
+- The autoscaler is capacity‑agnostic: it evaluates **every** F‑SKU capacity the collection notebook reports, each independently. Any capacity sitting well under 30% once enough history accrues becomes a scale‑down candidate (set `reservedFloorSku` for any capacity on an Azure reservation so it never scales below the reserved size).
 - See `docs/scaling-policy.md` for the recommended built‑in elastic features (capacity overage, surge protection, Spark autoscale billing) that absorb spikes so the runbook only handles sustained trends.
 - Possible v2: interactive‑vs‑background CU split per capacity (needs the `TREATAS` timepoint deep‑dive), off‑hours pause/resume, per‑capacity headroom.
